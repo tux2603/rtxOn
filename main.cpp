@@ -4,10 +4,15 @@
 #include <chrono>
 #include <string.h>
 
+#include <cuda_runtime.h>
+
 #include "ply.h"
+#include "raytrace.cuh"
 
 #define SCREEN_WIDTH 256
 #define SCREEN_HEIGHT 256
+
+#define BUFFER
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -23,6 +28,7 @@ void drawString(float x, float y, char *str, bool large = true);
 
 /// Shared memory between host and CPU
 float *pixelBuffer;
+float *devPixelBuffer;
 
 /// The number of faces in the model
 int numFaces = 0;
@@ -35,6 +41,10 @@ Vertex **vlist = nullptr;
 
 /// An array of all the raw face data in the model
 Face **flist = nullptr;
+
+Triangle *triangles;
+Triangle *devTriangles;
+int       numTriangles;
 
 
 
@@ -53,7 +63,11 @@ int main(int argc, char **argv) {
 
 void init(char *modelName) {
 
+#ifdef BUFFER
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+#else
+    glutInitDisplayMode(GLUT_RGB);
+#endif
 
     glutInitWindowPosition(50, 100);
     glutInitWindowSize(SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -63,19 +77,25 @@ void init(char *modelName) {
     sprintf(titleBuffer, "CUDA ray tracing | %s", modelName);
     glutCreateWindow(titleBuffer);
 
-    
+
     glMatrixMode(GL_PROJECTION);
     glOrtho(0, SCREEN_WIDTH, 0, SCREEN_HEIGHT, -1, 1);
 
     glClearColor(0, 0, 0, 1);
 
-    pixelBuffer = new GLfloat[SCREEN_WIDTH * SCREEN_HEIGHT * 3];
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, 0);
 
-    for(int i = 0; i < SCREEN_HEIGHT * SCREEN_WIDTH * 3; ++i) {
-        pixelBuffer[i] = i / (float)(SCREEN_HEIGHT * SCREEN_WIDTH * 3);
-        pixelBuffer[i + 1] = i / (float)(SCREEN_HEIGHT * SCREEN_WIDTH * 3);
-        pixelBuffer[i + 2] = i / (float)(SCREEN_HEIGHT * SCREEN_WIDTH * 3);
-    }
+    printf("Device has a compute capability of %d.%d and supports a maximum of %lu bytes of shared memory per block\n", props.major, props.minor, props.sharedMemPerBlock);
+
+    cudaMalloc((void **)&devPixelBuffer, SCREEN_WIDTH * SCREEN_HEIGHT * 3 * sizeof(float));
+    pixelBuffer = (float *)malloc(SCREEN_WIDTH * SCREEN_HEIGHT * 3 * sizeof(float));
+
+    // for (int i = 0; i < SCREEN_HEIGHT * SCREEN_WIDTH * 3; ++i) {
+    //     pixelBuffer[i]     = i / (float)(SCREEN_HEIGHT * SCREEN_WIDTH * 3);
+    //     pixelBuffer[i + 1] = i / (float)(SCREEN_HEIGHT * SCREEN_WIDTH * 3);
+    //     pixelBuffer[i + 2] = i / (float)(SCREEN_HEIGHT * SCREEN_WIDTH * 3);
+    // }
 
     read_test(modelName, &numFaces, &numVertices, &vlist, &flist);
 
@@ -108,6 +128,39 @@ void init(char *modelName) {
 
     float maxDelta = MAX(deltaX, MAX(deltaY, deltaZ));
 
+    printf("Max delta: %f\n", maxDelta);
+
+    Vector displacement = Vector(-(maxX + minX) / 2, -(maxY + minY) / 2, -(maxZ + minZ) / 2);
+
+    numTriangles = 0;
+    for (int i = 0; i < numFaces; ++i)
+        numTriangles += flist[i]->nverts - 2;
+    triangles = new Triangle[numTriangles];
+    cudaMalloc((void **)&devTriangles, numTriangles * sizeof(Triangle));
+
+
+    // Load in and initialize all of the triangles for faster reference
+    for (int i = 0, triangleIdx = 0; i < numFaces; ++i) {
+        Face *f = flist[i];
+        for (int j = 1; j < f->nverts - 1; ++j, ++triangleIdx) {
+            Vector v1 = (Vector(vlist[f->verts[0]]) + displacement) / maxDelta;
+            Vector v2 = (Vector(vlist[f->verts[j]]) + displacement) / maxDelta;
+            Vector v3 = (Vector(vlist[f->verts[j + 1]]) + displacement) / maxDelta;
+
+            triangles[triangleIdx] = Triangle(v1, v2, v3);
+
+            // printf("Triangle (%f, %f, %f)  (%f, %f, %f)  (%f, %f, %f)\n", 
+            //         triangles[i].a.x, triangles[i].a.y, triangles[i].a.z,
+            //         triangles[i].b.x, triangles[i].b.y, triangles[i].b.z,
+            //         triangles[i].c.x, triangles[i].c.y, triangles[i].c.z);
+        }
+    }
+
+    cudaMemcpy(devTriangles, triangles, numTriangles * sizeof(Triangle), cudaMemcpyHostToDevice);
+
+    // drawCircleKernel(devPixelBuffer, SCREEN_WIDTH, SCREEN_HEIGHT, 16, 16);
+    cudaMemcpy(pixelBuffer, devPixelBuffer, SCREEN_HEIGHT * SCREEN_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+
     glutDisplayFunc(draw);
     glutIdleFunc(glutPostRedisplay);
 
@@ -131,6 +184,13 @@ void draw() {
         numFrames  = 0;
     }
 
+    // drawCircleKernel(devPixelBuffer, SCREEN_WIDTH, SCREEN_HEIGHT, 8, 8);
+    CameraData camera = CameraData(Vector(0, 0, 10), Matrix::identity(), 8);
+    LightData  light  = LightData(Vector(0, 1, 0), Vector(1, 1, 0), Vector(0, 0, 1), 0.3f, 0.4f, 0.3f, 50.f);
+    drawRaytraceKernel(devPixelBuffer, devTriangles, numTriangles, SCREEN_WIDTH, SCREEN_HEIGHT, camera, light);
+
+    cudaMemcpy(pixelBuffer, devPixelBuffer, SCREEN_HEIGHT * SCREEN_WIDTH * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     glRasterPos2f(0, 0);
@@ -142,7 +202,10 @@ void draw() {
     free(fpsString);
 
     glFlush();
+
+#ifdef BUFFER
     glutSwapBuffers();
+#endif
 }
 
 void drawString(float x, float y, char *str, bool large) {
